@@ -937,9 +937,10 @@ async function parseJsonBounded<T>(
 /**
  * Indiana court rules.
  *
- * Per-request proxy of the Indiana Supreme Court's published Indiana Rules of
- * Court (statewide rules) and of each trial court's published local rules
- * page. Nothing is stored; only an in-isolate table of contents is memoised.
+ * Statewide rules: per-request proxy of the Indiana Supreme Court's published
+ * Indiana Rules of Court. County local rules: a stored copy of the text of the
+ * Indiana Judicial Branch's published county documents (fleet #3679), refreshed
+ * by scripts/bake-local-rules.mjs, served from KV via args._bakedIndex.
  */
 
 
@@ -1170,67 +1171,161 @@ function countySlug(raw: unknown): string {
   return s;
 }
 
-interface LinkRow { title: string; url: string }
+import type { InLocalDoc } from './in-local-rules-data.js';
 
-function extractLinks(html: string): LinkRow[] {
-  const out: LinkRow[] = [];
-  const re = /<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html))) {
-    out.push({ url: decodeEntities(m[1]), title: strip(m[2]) });
+// fleet #3679: the county local-rules TEXT is a stored copy, extracted from the
+// Indiana Judicial Branch's published county documents by
+// scripts/bake-local-rules.mjs. It lives in KV, not in the bundle: the gateway
+// injects it as `args._bakedIndex` (workers/gateway/src/pack-baked-indexes.json).
+// NEVER value-import ./in-local-rules-data.js here -- a type-only import is
+// erased, a value import puts ~6 MB of text into every isolate.
+let LOCAL: { capturedAt: string; counties: string[]; docs: InLocalDoc[]; texts: string[] } | null = null;
+function ensureLocal(args: Record<string, unknown>): NonNullable<typeof LOCAL> {
+  if (LOCAL) return LOCAL;
+  const idx = args._bakedIndex as Record<string, unknown> | null | undefined;
+  const docs = idx?.IN_LOCAL_DOCS;
+  const texts = idx?.IN_LOCAL_TEXTS;
+  const counties = idx?.IN_LOCAL_COUNTIES;
+  const capturedAt = idx?.IN_LOCAL_CAPTURED_AT;
+  if (!Array.isArray(docs) || !Array.isArray(texts) || !Array.isArray(counties) || docs.length === 0 || typeof capturedAt !== 'string') {
+    throw new Error(
+      `indiana-court-rules: the local-rules text store is unavailable (${idx == null ? 'not injected' : 'malformed'}). ` +
+        'The gateway loads it from KV on the first call into this pack; this is a server-side fault, not a bad county name -- retry shortly.',
+    );
   }
+  LOCAL = { capturedAt, counties: counties as string[], docs: docs as InLocalDoc[], texts: texts as string[] };
+  return LOCAL;
+}
+
+const COURTS_PAGE = (slug: string) => `${COURTS_ORIGIN}/courts/local/${slug}-county`;
+const STOP = new Set(['the', 'and', 'for', 'are', 'what', 'does', 'how', 'with', 'that', 'this', 'from', 'local', 'rules', 'rule', 'county', 'court', 'courts', 'require', 'requires', 'required', 'say', 'says', 'about', 'when', 'must', 'any', 'can']);
+
+function norm(s: string): string {
+  return s.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function passages(text: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  for (const para of text.split(/\n{2,}/)) {
+    if (cur && cur.length + para.length > 1400) { out.push(cur); cur = ''; }
+    cur += (cur ? '\n\n' : '') + para;
+  }
+  if (cur) out.push(cur);
   return out;
 }
 
-function absUrl(u: string): string {
-  return u.startsWith('http') ? u : COURTS_ORIGIN + (u.startsWith('/') ? u : '/' + u);
+function searchText(text: string, terms: string[], phrase: string): { score: number; excerpt: string }[] {
+  const scored: { score: number; excerpt: string }[] = [];
+  for (const p of passages(text)) {
+    const low = p.toLowerCase();
+    let score = 0;
+    let occ = 0;
+    for (const t of terms) {
+      const n = low.split(t).length - 1;
+      if (n > 0) { score += 10; occ += n; }
+    }
+    if (score === 0) continue;
+    score += Math.min(occ, 9);
+    if (phrase && low.includes(phrase)) score += 15;
+    scored.push({ score, excerpt: p.length > 1800 ? p.slice(0, 1800) + ' ...' : p });
+  }
+  return scored.sort((a, b) => b.score - a.score);
+}
+
+function ruleSlice(text: string, rule: string, maxChars: number): string | null {
+  const want = norm(rule);
+  if (want.length < 3) return null;
+  const lines = text.split('\n');
+  const prefix = want.slice(0, 4);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const n = norm(lines[i]);
+    if (n.startsWith(want) && lines[i].length < 200 && /:|\.|^\S/.test(lines[i])) {
+      // skip table-of-contents entries (dot leaders / trailing page number)
+      if (/\.{4,}|\s\d+\s*$/.test(lines[i])) continue;
+      start = i; break;
+    }
+  }
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const n = norm(lines[i]);
+    if (n.startsWith(prefix) && !n.startsWith(want) && lines[i].length < 200 && /^[A-Za-z]/.test(lines[i])) { end = i; break; }
+  }
+  const out = lines.slice(start, end).join('\n');
+  return out.length > maxChars ? out.slice(0, maxChars) + ' ...' : out;
 }
 
 async function localRules(args: Record<string, unknown>): Promise<unknown> {
-  const upstream = LOCAL_SOURCE;
+  const L = ensureLocal(args);
+  const source = LOCAL_SOURCE;
+  const dataAsOf = L.capturedAt;
   if (!args.county) {
-    const res = await pwFetch(`${COURTS_ORIGIN}/courts/publications/local-rules`, upstream);
-    if (!res.ok) throw new Error(`${upstream}: HTTP ${res.status}`);
-    const links = extractLinks(await res.text());
-    const counties = links
-      .filter((l) => /^\/courts\/local\/[a-z-]+-county$/.test(l.url))
-      .map((l) => l.title);
-    const general = links
-      .filter((l) => /(local rules|schedule for all local)/i.test(l.title))
-      .map((l) => ({ title: l.title, url: absUrl(l.url) }));
-    if (counties.length === 0) throw new Error(`${upstream}: county list parsed to zero rows; page format may have changed`);
-    return { source: upstream, county_count: counties.length, counties, statewide_local_rules_documents: general };
-  }
-  const slug = countySlug(args.county);
-  const pageUrl = `${COURTS_ORIGIN}/courts/local/${slug}-county`;
-  const res = await pwFetch(pageUrl, upstream);
-  if (res.status === 404) throw new Error(`No Indiana county page for "${String(args.county)}". Call in_local_rules with no county for the 92 valid names.`);
-  if (!res.ok) throw new Error(`${upstream}: HTTP ${res.status}`);
-  const html = await res.text();
-  const title = strip(/<title>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? '');
-  const docs = extractLinks(html)
-    .filter((l) => /rules|governance plan|caseload|local court rule|standing order/i.test(l.title) && !/^#/.test(l.url))
-    .filter((l) => !/^\/courts\/public-records\/orders\//.test(l.url))
-    .filter((l) => !/^\/courts\/(supreme|appeals|tax|local|clerk|oja|public-records|publications|services)$/.test(l.url))
-    .map((l) => ({ title: l.title, url: absUrl(l.url) }));
-  const seen = new Set<string>();
-  const documents = docs.filter((d) => (seen.has(d.url) ? false : (seen.add(d.url), true)));
-  if (documents.length === 0) {
+    const counties = L.counties.map((c) => {
+      const d = L.docs.filter((r) => r[0] === c);
+      return { county: c, documents: d.length, documents_with_text: d.filter((r) => r[3] >= 0).length };
+    });
+    const withText = counties.filter((c) => c.documents_with_text > 0).length;
     return {
-      source: upstream,
-      county: slug,
-      county_page: pageUrl,
-      documents: [],
-      note: `The ${slug} county page lists no local-rules document. Open the county page directly; the court may publish rules elsewhere.`,
+      source, data_as_of: dataAsOf, county_count: counties.length, counties_with_rule_text: withText,
+      counties_without_rule_text: counties.filter((c) => c.documents_with_text === 0).map((c) => c.county),
+      counties,
     };
   }
+  const slug = countySlug(args.county);
+  if (!L.counties.includes(slug)) {
+    throw new Error(`No Indiana county "${String(args.county)}". Call in_local_rules with no county for the ${L.counties.length} valid names.`);
+  }
+  const rows = L.docs.map((r, i) => ({ r, i })).filter((x) => x.r[0] === slug);
+  const county_page = COURTS_PAGE(slug);
+  if (rows.length === 0) {
+    return {
+      source, data_as_of: dataAsOf, county: slug, county_page, documents: [], text_available: false,
+      note: `The Indiana Judicial Branch lists no local-rules document for ${slug} county, so there is no rule text to return. Open the county page; the court may publish rules elsewhere.`,
+    };
+  }
+  const documents = rows.map((x, n) => ({
+    document: n + 1, title: x.r[1], url: x.r[2], text_available: x.r[3] >= 0,
+    chars: x.r[3] >= 0 ? L.texts[x.r[3]].length : 0,
+    ...(x.r[3] < 0 ? { reason: x.r[4] ?? 'no text extracted' } : {}),
+  }));
+  const base = { source, data_as_of: dataAsOf, county: slug, county_page, documents };
+  const readable = rows.filter((x) => x.r[3] >= 0);
+  if (readable.length === 0) {
+    return { ...base, text_available: false, note: `No rule text is available for ${slug} county: its published documents have no machine-readable text (see reason on each). Use the document links.` };
+  }
+  const maxChars = Math.min(20000, Math.max(500, Number(args.max_chars) || 6000));
+  const docNo = args.document != null ? Number(args.document) : 0;
+  if (docNo && (!Number.isInteger(docNo) || docNo < 1 || docNo > rows.length)) throw new Error(`document must be 1..${rows.length} for ${slug} county`);
+  const pick = docNo ? [{ x: rows[docNo - 1], n: docNo }] : rows.map((x, k) => ({ x, n: k + 1 })).filter((p) => p.x.r[3] >= 0);
+  if (docNo && rows[docNo - 1].r[3] < 0) return { ...base, text_available: false, note: `Document ${docNo} has no machine-readable text (${rows[docNo - 1].r[4] ?? 'none extracted'}). Use its link.` };
+
+  if (args.rule) {
+    for (const p of pick) {
+      const t = ruleSlice(L.texts[p.x.r[3]], String(args.rule), maxChars);
+      if (t) return { ...base, text_available: true, rule: String(args.rule), found: true, document: p.n, title: p.x.r[1], text: t };
+    }
+    return { ...base, text_available: true, rule: String(args.rule), found: false, note: `No rule headed "${String(args.rule)}" was found in the ${slug} county text. Try query for a keyword search, or omit rule to read the document from the start.` };
+  }
+  if (args.query) {
+    const phrase = String(args.query).toLowerCase().trim();
+    const terms = [...new Set(phrase.split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !STOP.has(w)))];
+    if (terms.length === 0) throw new Error('query had no searchable words');
+    const hits: { document: number; title: string; score: number; excerpt: string }[] = [];
+    for (const p of pick) for (const h of searchText(L.texts[p.x.r[3]], terms, phrase)) hits.push({ document: p.n, title: p.x.r[1], ...h });
+    hits.sort((a, b) => b.score - a.score);
+    if (hits.length === 0) return { ...base, text_available: true, query: String(args.query), matched: 0, note: `No passage in ${slug} county's local rules mentions ${terms.join(', ')}. This is a search of the extracted text, not proof the court has no such rule; read the document directly (omit query) or open its link.` };
+    return { ...base, text_available: true, query: String(args.query), matched: hits.length, passages: hits.slice(0, 5) };
+  }
+  const p = pick[0];
+  const text = L.texts[p.x.r[3]];
+  const offset = Math.max(0, Math.min(text.length, Number(args.offset) || 0));
+  const slice = text.slice(offset, offset + maxChars);
   return {
-    source: upstream,
-    county: slug,
-    county_page: pageUrl,
-    page_title: title,
-    documents,
-    note: 'Local rules are published by each court as documents, not as per-rule pages; this tool returns the document links, not the rule text. Statewide rules are available through in_court_rule.',
+    ...base, text_available: true, document: p.n, title: p.x.r[1], total_chars: text.length, offset,
+    next_offset: offset + slice.length < text.length ? offset + slice.length : null, text: slice,
+    note: 'Start of the document (usually its table of contents). Pass rule="<citation>" for one rule, query="<words>" for a keyword search across the county, document=N for another document, offset for the next page.',
   };
 }
 
@@ -1275,13 +1370,18 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'in_local_rules',
     description:
-      'Where an Indiana county\'s local court rules are published. Given a county (e.g. "Johnson"), returns the links to that county\'s current local-rules documents, district governance plan and city-court rules as listed by the Indiana Judicial Branch. ' +
-      'Returns document links, not rule text (local rules are published as documents). With no county, returns the list of counties. ' +
+      'Text of an Indiana county\'s local court rules (circuit/superior court rules, district governance plan, city-court rules). Given a county (e.g. "Johnson"), returns the county\'s documents and the rule text: pass query for a keyword search across the county\'s rules ("motion practice", "bond", "court reporter"), rule for one citation as the county numbers it ("LR41-TR-102"), or neither to read the document from the start (paginate with offset). ' +
+      'Covers 91 of 92 counties; a document with no machine-readable text, or a county with no published rules, says so and returns the document link rather than an empty answer. With no county, returns every county with its coverage. Every response carries data_as_of. ' +
       `Source: ${LOCAL_SOURCE}.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
-        county: { type: 'string', description: 'Indiana county name, with or without "County", e.g. "Johnson", "St. Joseph". Omit to list counties.' },
+        county: { type: 'string', description: 'Indiana county name, with or without "County", e.g. "Johnson", "St. Joseph". Omit to list counties and coverage.' },
+        query: { type: 'string', description: 'Keywords to find in the county\'s local rules, e.g. "motion for continuance". Returns the best-matching passages.' },
+        rule: { type: 'string', description: 'A rule citation as the county numbers it, e.g. "LR41-TR-102". Returns that rule\'s text.' },
+        document: { type: 'number', description: '1-based document number from the documents list, to restrict to one document.' },
+        offset: { type: 'number', description: 'Character offset when reading a document from the start.' },
+        max_chars: { type: 'number', description: 'Maximum characters of rule text to return (500-20000, default 6000).' },
       },
     },
   },

@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-indiana-court-rules",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Indiana court rules.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-60bc993c76475ebc79f3c07230b02cdc401a95744ad82270766068fe1bd33d06",
-    "sourceCommit": "24e32b525f9c0b2fd7d94b519b08abb108cc11cd"
+    "sourceHash": "v1-bceb7f45127708785984382f38effd4f5ae1e24d16dde0b72e542e2ed637aa16",
+    "sourceCommit": "f54ad77e789f27fe393978f9c080b5b18c87bb4f"
   }
 }

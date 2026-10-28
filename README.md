@@ -1,27 +1,29 @@
 # @pipeworx/indiana-court-rules
 
-Indiana's statewide court rules by citation (Trial Rule 60(B), Appellate Rule 9, Evidence Rule 401, Professional Conduct 1.6 and the rest of the Indiana Rules of Court), plus where each county publishes its local court rules.
+Indiana's statewide court rules by citation (Trial Rule 60(B), Appellate Rule 9, Evidence Rule 401, Professional Conduct 1.6 and the rest of the Indiana Rules of Court), plus the text of each county's local court rules.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1881+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `in_court_rule(set, rule)` — full text of one rule: heading, effective date, text with its subdivisions, and the published version history where there is one. A subdivision such as `60(B)` also returns just that part. Answers "what does Trial Rule 60(B) say, verbatim".
 - `in_court_rules_list(set?)` — every rule in a set with its number and title (to find the right citation), or, with no set, all 24 rule sets with their rule counts.
-- `in_local_rules(county?)` — the current local-rules documents a county's courts publish (county local rules, district governance plan, city-court rules), as links. With no county, the 92 counties.
+- `in_local_rules(county?, query?, rule?, document?, offset?)` — the text of a county's local rules (circuit/superior court rules, district governance plan, city-court rules). `query` returns the best-matching passages ("filing motions"), `rule` returns one rule by the county's own citation ("LR41-TR-102"), and neither reads a document from the start. Every response lists the county's documents with their links, and carries `data_as_of`. A document with no machine-readable text (a scanned image, or one that cannot be parsed) is reported as such with its link, never as an empty answer. With no county, returns all 92 counties with their coverage.
 
 ## Auth
 
 Keyless.
 
-Local rules are published by each court as documents, so `in_local_rules` returns the document links and does not extract their text. Statewide rules are returned as text.
+Statewide rules are returned live from the publisher. County local rules are published by each court as documents; their text is extracted into a stored copy, so `in_local_rules` answers from that copy and says when it was taken.
 
 ## Data sources
 
 - Indiana Supreme Court, Indiana Rules of Court — the current version of each statewide rule.
 - Indiana Supreme Court, Indiana Judicial Branch — each county's local court rules page.
 
-Every call goes to the publisher; nothing is stored. The rule index is held in memory for a day.
+Statewide rule calls go to the publisher; the rule index is held in memory for a day. County local rules are a stored copy of the publisher's documents (public Indiana court material), refreshed by re-running `scripts/bake-local-rules.mjs` (needs poppler's text extractor) and committing the regenerated module; the deploy loads it into KV, not the bundle. Proposed (not yet in effect) local rules are not included.
+
+Coverage at capture (2026-10-26): all 92 counties have at least one document with extractable text. 13 of the 184 listed documents (mostly district governance plans published as scanned images, plus one small city-court document and one appendix file) have no text layer; those are reported with their link.
 
 Not the Indiana Code (statutes): use `indiana-code`.
 
@@ -74,7 +76,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1881+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
