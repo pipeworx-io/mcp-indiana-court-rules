@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-indiana-court-rules",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Indiana court rules.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "indiana-court-rules",
     "gatewaySlug": "indiana-court-rules",
-    "sourceHash": "v1-da2100cd5fd371d7219330de5b5b2e69a7e44f828a5618db63538882a2ab9dc1",
-    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
+    "sourceHash": "v1-e96a9a1626373882e297c8c45fcaa13fe466df72ff2f5c0c638e485461472ef7",
+    "sourceCommit": "0ca9712c0ac03bb0121cc7e81b202d0c45ac02ca"
   }
 }
